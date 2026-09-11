@@ -1,15 +1,13 @@
 import asyncio
 import os
 import re
-import json
-import subprocess
 import time
 from pyrogram import Client, filters
 import yt_dlp
 
 API_ID = 1234567              # <-- Ваш api_id
 API_HASH = "your_api_hash"    # <-- Ваш api_hash
-BOT_TOKEN = "your_bot_token"  # <-- Ваш бот token
+BOT_TOKEN = "your_bot_token"  # <-- Ваш bot token
 
 DELETE_AFTER_SEND = False     # True — удалять файлы с диска после успешной отправки
 
@@ -29,15 +27,14 @@ def format_comments(info, url):
     lines = [f"{url}\n"]
     lines.append(info.get('title', ''))
     lines.append("--------------------------------------------------")
-    view_count = info.get('view_count', 'N/A')
-    like_count = info.get('like_count', 'N/A')
-    comment_count = info.get('comment_count', 'N/A')
+    view_count = info.get('view_count') or 'N/A'
+    like_count = info.get('like_count') or 'N/A'
+    comment_count = info.get('comment_count') or 'N/A'
     lines.append(f"Просмотров: {view_count}   Лайков: {like_count}   Комментариев: {comment_count}")
     lines.append("--------------------------------------------------")
-    comments = info.get('comments', [])
-    for c in comments:
+    for c in info.get('comments') or []:
         prefix = "+" if c.get('parent') == "root" else "\t+"
-        like = c.get('like_count', 0)
+        like = c.get('like_count') or 0
         author = c.get('author', '')
         text = c.get('text', '').replace('\n', ' ')
         lines.append(f"{prefix}{like} @{author} >>> {text}")
@@ -48,7 +45,9 @@ async def async_download_video_and_info(ydl_opts, url):
     def blocking():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+            # prepare_filename() не знает про слияние в mp4 и может вернуть
+            # имя несуществующего файла (.webm/.mkv) — берём итоговый путь
+            filename = info["requested_downloads"][0]["filepath"]
             return info, filename
     return await loop.run_in_executor(None, blocking)
 
@@ -91,9 +90,14 @@ async def download_video(client, message):
 
     ydl_opts = {
         'format': 'bestvideo[height<=1080]+bestaudio/best',
-        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
+        # заголовок до 80 символов + [id] — нет коллизий имён и длинных путей
+        'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title).80s [%(id)s].%(ext)s'),
         'merge_output_format': 'mp4',
         'concurrent_fragment_downloads': 4,
+        'trim_file_name': 150,       # страховка: аналог --trim-filenames (лимит без учёта расширения)
+        'noplaylist': True,          # ссылка с list= не должна тянуть весь плейлист
+        'getcomments': True,         # это и есть --write-comments: комментарии придут в info
+        'remote_components': ['ejs:github'],
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts['cookiefile'] = COOKIES_PATH
@@ -112,30 +116,16 @@ async def download_video(client, message):
         )
 
         base = os.path.splitext(os.path.basename(filename))[0]
-        info_json_path = os.path.join(DOWNLOAD_DIR, f"{base}.info.json")
-
-        yt_dlp_cmd = ["yt-dlp", "-J", "--write-comments", "--remote-components", "ejs:github"]
-        if os.path.exists(COOKIES_PATH):
-            yt_dlp_cmd += ["--cookies", COOKIES_PATH]
-        yt_dlp_cmd.append(url)
-
-        print("Получаю комментарии...")
-        with open(info_json_path, "w", encoding="utf-8") as fjson:
-            subprocess.run(yt_dlp_cmd, stdout=fjson, check=True)
-
-        if os.path.exists(info_json_path):
-            with open(info_json_path, "r", encoding="utf-8") as f:
-                info_json_data = json.load(f)
-            if info_json_data.get("comments"):
-                txt_filename = os.path.join(DOWNLOAD_DIR, f"{base}.txt")
-                with open(txt_filename, "w", encoding="utf-8") as ftxt:
-                    ftxt.write(format_comments(info_json_data, url))
-                txt_file = txt_filename
-                await client.send_document(
-                    message.chat.id,
-                    txt_filename,
-                    caption="✅ Комментарии к видео (.txt)",
-                )
+        if info.get('comments'):
+            txt_filename = os.path.join(DOWNLOAD_DIR, f"{base}.txt")
+            with open(txt_filename, "w", encoding="utf-8") as ftxt:
+                ftxt.write(format_comments(info, url))
+            txt_file = txt_filename
+            await client.send_document(
+                message.chat.id,
+                txt_filename,
+                caption="✅ Комментарии к видео (.txt)",
+            )
 
         await status_msg.delete()
         print("Готово ✅")
